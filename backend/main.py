@@ -86,6 +86,138 @@ async def get_flagged_transactions() -> List[Transaction]:
     return [txn for txn in fraud_engine.transactions if txn["fraud_status"]]
 
 
+@app.get("/alerts")
+async def get_alerts():
+    # Derive alerts from recent transactions and triggered rules
+    alerts = []
+    recent = fraud_engine.transactions[-50:][::-1]
+    for idx, txn in enumerate(recent[:20]):
+        severity = 'MEDIUM'
+        if txn['risk_score'] >= 80:
+            severity = 'CRITICAL'
+        elif txn['risk_score'] >= 60:
+            severity = 'HIGH'
+        elif txn['risk_score'] >= 40:
+            severity = 'MEDIUM'
+        else:
+            severity = 'LOW'
+
+        category = txn.get('triggered_rules', [None])[0] or 'ANOMALY'
+        message = f"{txn['payer_id']} → {txn['payee_id']} amount ₹{txn['amount']} (score {txn['risk_score']})"
+        alerts.append({
+            'id': txn['transaction_id'],
+            'severity': severity,
+            'category': category,
+            'message': message,
+            'timestamp': txn['timestamp'],
+            'escalated': txn['fraud_status']
+        })
+
+    return {'alerts': alerts}
+
+
+@app.get('/timeline')
+async def get_timeline():
+    # Build a simple event timeline based on recent transactions
+    events = []
+    recent = fraud_engine.transactions[-30:]
+    for txn in recent[::-1]:
+        ev_type = 'normal'
+        if txn['risk_score'] >= 80:
+            ev_type = 'critical'
+        elif txn['risk_score'] >= 60:
+            ev_type = 'warning'
+
+        label = txn.get('triggered_rules', ['Anomaly'])[0]
+        events.append({
+            'id': txn['transaction_id'],
+            'type': ev_type,
+            'label': label,
+            'time': txn['timestamp'],
+            'icon': None,
+        })
+
+    return {'events': events}
+
+
+@app.get('/risk-distribution')
+async def get_risk_distribution():
+    # Map risk_score to severity buckets
+    buckets = {'Safe': 0, 'Monitor': 0, 'Suspicious': 0, 'High Risk': 0}
+    for txn in fraud_engine.transactions:
+        score = txn.get('risk_score', 0)
+        if score < 30:
+            buckets['Safe'] += 1
+        elif score < 50:
+            buckets['Monitor'] += 1
+        elif score < 70:
+            buckets['Suspicious'] += 1
+        else:
+            buckets['High Risk'] += 1
+
+    data = [
+        {'name': 'Safe', 'value': buckets['Safe'], 'color': '#16A34A'},
+        {'name': 'Monitor', 'value': buckets['Monitor'], 'color': '#D97706'},
+        {'name': 'Suspicious', 'value': buckets['Suspicious'], 'color': '#EA580C'},
+        {'name': 'High Risk', 'value': buckets['High Risk'], 'color': '#DC2626'},
+    ]
+    return {'distribution': data}
+
+
+@app.get('/insights')
+async def get_insights():
+    # Compute simple insights from transaction history
+    device_counts = {}
+    payer_max_score = {}
+    hourly_counts = {}
+    new_beneficiary_counts = 0
+
+    seen_payee_by_payer = {}
+
+    for txn in fraud_engine.transactions:
+        dev = txn.get('device_id')
+        payer = txn.get('payer_id')
+        payee = txn.get('payee_id')
+        score = txn.get('risk_score', 0)
+        timestamp = txn.get('timestamp')
+
+        device_counts[dev] = device_counts.get(dev, 0) + 1
+        payer_max_score[payer] = max(payer_max_score.get(payer, 0), score)
+
+        hour = None
+        try:
+            hour = int(timestamp.split(':')[0])
+        except Exception:
+            hour = 0
+        hourly_counts[hour] = hourly_counts.get(hour, 0) + 1
+
+        seen = seen_payee_by_payer.setdefault(payer, set())
+        if payee not in seen:
+            new_beneficiary_counts += 1
+            seen.add(payee)
+
+    most_suspicious_device = max(device_counts.items(), key=lambda x: x[1])[0] if device_counts else None
+    highest_risk_payer = max(payer_max_score.items(), key=lambda x: x[1])[0] if payer_max_score else None
+
+    midnight_count = sum(v for k, v in hourly_counts.items() if k in (0, 1, 2))
+    avg_hourly = sum(hourly_counts.values()) / (len(hourly_counts) or 1)
+    midnight_spike = f"{(midnight_count / (avg_hourly or 1) * 100):.0f}%" if avg_hourly > 0 else '0%'
+
+    # velocity attacks count via triggered rules
+    velocity_attacks = sum(1 for txn in fraud_engine.transactions if 'HIGH_VELOCITY' in txn.get('triggered_rules', []))
+
+    insights = [
+        {'id': '1', 'title': 'Most Suspicious Device', 'value': most_suspicious_device or 'unknown', 'detail': f"{device_counts.get(most_suspicious_device,0)} flagged transactions"},
+        {'id': '2', 'title': 'Highest Risk Payer', 'value': highest_risk_payer or 'unknown', 'detail': f"Risk score: {payer_max_score.get(highest_risk_payer,0)}"},
+        {'id': '3', 'title': 'Midnight Activity Spike', 'value': midnight_spike, 'detail': 'vs normal activity'},
+        {'id': '4', 'title': 'Rapid Location Switching', 'value': 'N/A', 'detail': 'computed from locations'},
+        {'id': '5', 'title': 'New Beneficiary Spike', 'value': f"{new_beneficiary_counts}", 'detail': 'new payees detected'},
+        {'id': '6', 'title': 'Velocity Attack Pattern', 'value': f"{velocity_attacks} detected", 'detail': 'across devices'},
+    ]
+
+    return {'insights': insights}
+
+
 @app.get("/stats", response_model=StatsResponse)
 async def get_statistics():
     total = len(fraud_engine.transactions)
@@ -104,11 +236,6 @@ async def get_statistics():
 @app.get("/export")
 async def export_flagged_transactions():
     flagged = [txn for txn in fraud_engine.transactions if txn["fraud_status"]]
-    if not flagged:
-        return Response(
-            content="No flagged transactions to export",
-            media_type="text/plain"
-        )
     csv_content = export_transactions_csv(flagged)
     return Response(
         content=csv_content,

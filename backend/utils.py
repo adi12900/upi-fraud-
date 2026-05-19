@@ -43,9 +43,6 @@ def is_trusted_merchant(payee_id: str) -> bool:
 
 
 def export_transactions_csv(transactions: List[Dict[str, Any]]) -> str:
-    if not transactions:
-        return ""
-    
     output = StringIO()
     writer = csv.DictWriter(
         output,
@@ -57,6 +54,9 @@ def export_transactions_csv(transactions: List[Dict[str, Any]]) -> str:
     )
     
     writer.writeheader()
+    if not transactions:
+        return output.getvalue()
+
     for txn in transactions:
         txn_row = txn.copy()
         txn_row["triggered_rules"] = "|".join(txn.get("triggered_rules", []))
